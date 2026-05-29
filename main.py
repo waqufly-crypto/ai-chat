@@ -1,78 +1,102 @@
+#!/usr/bin/env python3
 """
-Терминальный чат-клиент для LLM с OpenAI-совместимым API.
+🤖 AI Chat — терминальный чат-клиент для LLM (OpenAI-совместимый API).
 
-Поддерживает стриминг, thinking-модели, историю сессий,
-многострочный ввод и расчёт стоимости запросов.
+Возможности:
+- Стриминг ответов в реальном времени (rich.live.Live)
+- Markdown-рендеринг (переключаемый на лету)
+- Поддержка thinking-моделей (reasoning_content)
+- Персистентная история ввода и автозавершение (prompt_toolkit)
+- История сессий, глобальная статистика токенов и стоимости
+- Многострочный ввод (Ctrl+Enter — отправка)
+- Неинтерактивный режим (--output) для скриптов/пайпов
 """
 
+# ============================================================================
+# 1. ИМПОРТЫ
+# ============================================================================
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
-import traceback
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional, TypedDict
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Импорты сторонних библиотек с понятной ошибкой при отсутствии
-# ──────────────────────────────────────────────────────────────────────────────
+# Внешние зависимости
 try:
-    from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError, RateLimitError
-except ImportError:
-    print("Ошибка: не установлена библиотека openai. Выполните: pip install openai", file=sys.stderr)
+    from openai import OpenAI
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        APITimeoutError,
+        AuthenticationError,
+        RateLimitError,
+    )
+except ImportError:  # pragma: no cover
+    print("Не установлена библиотека 'openai'. Выполните: pip install openai", file=sys.stderr)
     sys.exit(1)
 
 try:
     from rich.console import Console
+    from rich.live import Live
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.rule import Rule
     from rich.table import Table
-    from rich.live import Live
     from rich.text import Text
-    from rich.console import Group
-except ImportError:
-    print("Ошибка: не установлена библиотека rich. Выполните: pip install rich", file=sys.stderr)
+except ImportError:  # pragma: no cover
+    print("Не установлена библиотека 'rich'. Выполните: pip install rich", file=sys.stderr)
     sys.exit(1)
 
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.application import get_app
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import Completer, Completion, merge_completers
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.history import InMemoryHistory
-    from prompt_toolkit.formatted_text import HTML
-    from prompt_toolkit.styles import Style as PTStyle
-except ImportError:
-    print("Ошибка: не установлена библиотека prompt_toolkit. Выполните: pip install prompt_toolkit", file=sys.stderr)
+except ImportError:  # pragma: no cover
+    print(
+        "Не установлена библиотека 'prompt_toolkit'. Выполните: pip install prompt_toolkit",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Константы
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ============================================================================
+# 2. КОНСТАНТЫ
+# ============================================================================
 VERSION = "1.0.0"
 
+# Пути (всё рядом с main.py)
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
 HISTORY_DIR = BASE_DIR / "history"
+INPUT_HISTORY_PATH = BASE_DIR / ".input_history"
+USAGE_STATS_PATH = BASE_DIR / "usage_stats.json"
 
-MAX_FILE_SIZE = 100 * 1024  # 100 КБ — лимит для команды /file
-MAX_RETRIES = 3              # Количество попыток при сетевых ошибках
-RETRY_DELAYS = [1, 2, 4]     # Задержки между попытками (секунды)
+# Лимиты
+MAX_FILE_SIZE = 100 * 1024  # 100 KB для /file и --input
+MAX_PASTE_PREVIEW_LINES = 30  # лимит строк при предпросмотре вставки
+CONTEXT_WARN_THRESHOLD = 0.80  # порог предупреждения о контексте (80%)
+MAX_RETRIES = 3  # количество повторных попыток при сетевых ошибках
 
-# Шаблон конфига при первом запуске
-DEFAULT_CONFIG = {
+# Шаблон конфига по умолчанию (создаётся при первом запуске)
+DEFAULT_CONFIG: dict[str, Any] = {
     "api_key": "sk-YOUR-KEY-HERE",
     "api_base": "https://api.openai.com/v1",
     "default_model": "gpt-4o",
     "system_prompt": "Ты полезный ассистент.",
+    "render_markdown": False,
     "generation": {
         "temperature": 0.7,
         "top_p": 1.0,
-        "max_tokens": 4096
+        "max_tokens": 4096,
     },
     "models": [
         {
@@ -80,7 +104,7 @@ DEFAULT_CONFIG = {
             "name": "GPT-4o",
             "context_window": 128000,
             "input_price_per_1m_tokens_rub": 150.0,
-            "output_price_per_1m_tokens_rub": 600.0
+            "output_price_per_1m_tokens_rub": 600.0,
         },
         {
             "id": "deepseek-reasoner",
@@ -88,62 +112,86 @@ DEFAULT_CONFIG = {
             "context_window": 65536,
             "supports_thinking": True,
             "input_price_per_1m_tokens_rub": 3.0,
-            "output_price_per_1m_tokens_rub": 15.0
-        }
-    ]
+            "output_price_per_1m_tokens_rub": 15.0,
+        },
+    ],
+}
+
+# Список команд для автозавершения
+COMMANDS = [
+    "/new",
+    "/history",
+    "/model",
+    "/markdown",
+    "/md",
+    "/file",
+    "/clear",
+    "/usage",
+    "/help",
+    "/exit",
+]
+
+# Аргументы команд для автозавершения
+COMMAND_ARGS: dict[str, list[str]] = {
+    "/new": ["--clear"],
+    "/history": ["all"],
+    "/model": ["--default", "--provider"],
+    "/markdown": ["on", "off", "toggle"],
+    "/md": ["on", "off", "toggle"],
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Типы данных
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# 3. ТИПЫ ДАННЫХ
+# ============================================================================
+class Usage(TypedDict, total=False):
+    """Статистика использования токенов одного ответа."""
 
-@dataclass
-class ModelInfo:
-    """Информация о модели из конфига."""
-    id: str
-    name: str
-    context_window: int = 128000
-    supports_thinking: bool = False
-    input_price_per_1m_tokens_rub: float = 0.0
-    output_price_per_1m_tokens_rub: float = 0.0
+    prompt_tokens: int
+    completion_tokens: int
+    reasoning_tokens: int
 
 
 @dataclass
 class Message:
-    """Одно сообщение в истории чата."""
-    role: str                              # system | user | assistant
+    """Одно сообщение в диалоге."""
+
+    role: str  # "system" | "user" | "assistant"
     content: str
     timestamp: str = ""
-    model: Optional[str] = None            # Только для assistant
-    thinking: Optional[str] = None         # Reasoning-контент (если был)
-    usage: Optional[dict[str, int]] = None # {"prompt_tokens": N, "completion_tokens": M}
-    interrupted: bool = False              # Прервано ли Ctrl+C
+    model: Optional[str] = None  # модель, сгенерировавшая ответ (для assistant)
+    thinking: Optional[str] = None  # размышления (reasoning_content), только для отображения
+    usage: Optional[dict[str, int]] = None  # токены ответа
+    interrupted: bool = False  # был ли ответ прерван (Ctrl+C)
+
+    def __post_init__(self) -> None:
+        if not self.timestamp:
+            self.timestamp = datetime.now().isoformat(timespec="seconds")
 
     def to_api_dict(self) -> dict[str, str]:
-        """Возвращает dict для отправки в API (без служебных полей)."""
+        """Возвращает словарь для отправки в API (без thinking/usage/прочего)."""
         return {"role": self.role, "content": self.content}
 
-    def to_json(self) -> dict[str, Any]:
-        """Сериализация в JSON для сохранения."""
-        d: dict[str, Any] = {
+    def to_json_dict(self) -> dict[str, Any]:
+        """Возвращает словарь для сохранения в JSON-файл сессии."""
+        data: dict[str, Any] = {
             "role": self.role,
             "content": self.content,
             "timestamp": self.timestamp,
         }
-        if self.model is not None:
-            d["model"] = self.model
+        if self.model:
+            data["model"] = self.model
         if self.thinking:
-            d["thinking"] = self.thinking
-        if self.usage is not None:
-            d["usage"] = self.usage
+            data["thinking"] = self.thinking
+        if self.usage:
+            data["usage"] = self.usage
         if self.interrupted:
-            d["interrupted"] = True
-        return d
+            data["interrupted"] = True
+        return data
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> "Message":
-        """Десериализация из JSON."""
+    def from_json_dict(cls, data: dict[str, Any]) -> "Message":
+        """Восстанавливает сообщение из словаря JSON."""
         return cls(
             role=data["role"],
             content=data["content"],
@@ -157,243 +205,377 @@ class Message:
 
 @dataclass
 class Session:
-    """Сессия чата — набор сообщений + метаданные."""
+    """Сессия диалога с моделью."""
+
     session_id: str
     created_at: str
     default_model: str
     messages: list[Message] = field(default_factory=list)
 
-    def to_json(self) -> dict[str, Any]:
+    @property
+    def total_tokens(self) -> int:
+        """Суммарное количество токенов сессии (prompt + completion)."""
+        total = 0
+        for msg in self.messages:
+            if msg.usage:
+                total += msg.usage.get("prompt_tokens", 0)
+                total += msg.usage.get("completion_tokens", 0)
+        return total
+
+    def first_user_message(self) -> str:
+        """Возвращает текст первого сообщения пользователя (или пустую строку)."""
+        for msg in self.messages:
+            if msg.role == "user":
+                return msg.content
+        return ""
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Сериализует сессию в словарь для сохранения."""
         return {
             "session_id": self.session_id,
             "created_at": self.created_at,
             "default_model": self.default_model,
-            "messages": [m.to_json() for m in self.messages],
+            "total_tokens": self.total_tokens,
+            "messages": [m.to_json_dict() for m in self.messages],
         }
 
+
+@dataclass
+class ModelInfo:
+    """Информация о модели из конфига."""
+
+    id: str
+    name: str
+    context_window: int = 128000
+    supports_thinking: bool = False
+    input_price_per_1m_tokens_rub: Optional[float] = None
+    output_price_per_1m_tokens_rub: Optional[float] = None
+
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> "Session":
+    def from_dict(cls, data: dict[str, Any]) -> "ModelInfo":
+        """Создаёт ModelInfo из словаря конфига с применением дефолтов."""
         return cls(
-            session_id=data["session_id"],
-            created_at=data["created_at"],
-            default_model=data.get("default_model", ""),
-            messages=[Message.from_json(m) for m in data.get("messages", [])],
+            id=data["id"],
+            name=data.get("name", data["id"]),
+            context_window=data.get("context_window", 128000),
+            supports_thinking=data.get("supports_thinking", False),
+            input_price_per_1m_tokens_rub=data.get("input_price_per_1m_tokens_rub"),
+            output_price_per_1m_tokens_rub=data.get("output_price_per_1m_tokens_rub"),
         )
 
+    def has_pricing(self) -> bool:
+        """Заданы ли цены для расчёта стоимости."""
+        return (
+            self.input_price_per_1m_tokens_rub is not None
+            and self.output_price_per_1m_tokens_rub is not None
+        )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Конфигурация
-# ──────────────────────────────────────────────────────────────────────────────
 
 class ConfigError(Exception):
-    """Ошибка валидации/парсинга конфига."""
+    """Ошибка валидации конфигурации."""
 
 
+# ============================================================================
+# 4. КЛАСС Config — загрузка, валидация, дефолты, сохранение default_model
+# ============================================================================
 class Config:
-    """Загрузка и валидация конфигурации приложения."""
+    """
+    Конфигурация приложения.
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.api_key: str = ""
-        self.api_base: str = ""
-        self.default_model: str = ""
-        self.system_prompt: str = ""
-        self.temperature: float = 0.7
-        self.top_p: float = 1.0
-        self.max_tokens: int = 4096
-        self.models: list[ModelInfo] = []
+    Загружает config.json, валидирует обязательные поля и типы,
+    подставляет дефолты для необязательных полей, умеет обновлять
+    default_model с сохранением форматирования файла.
+    """
 
-    @classmethod
-    def ensure_exists(cls, path: Path) -> bool:
-        """Создаёт шаблон конфига, если файл не существует. Возвращает True если создан."""
-        if path.exists():
-            return False
-        path.write_text(
-            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-        return True
+    REQUIRED_FIELDS = ("api_key", "api_base", "default_model")
 
-    @classmethod
-    def load(cls, path: Path) -> "Config":
-        """Загружает и валидирует конфиг."""
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError as e:
-            raise ConfigError(f"Не удалось прочитать config.json: {e}")
+    def __init__(self, raw: dict[str, Any]) -> None:
+        self._raw = raw
+        self.api_key: str = raw["api_key"]
+        self.api_base: str = raw["api_base"]
+        self.default_model: str = raw["default_model"]
+        self.system_prompt: str = raw.get("system_prompt", "Ты полезный ассистент.")
+        self.render_markdown: bool = raw.get("render_markdown", False)
 
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ConfigError(
-                f"Ошибка парсинга config.json (строка {e.lineno}, колонка {e.colno}): {e.msg}"
-            )
+        gen = raw.get("generation", {})
+        self.temperature: float = gen.get("temperature", 0.7)
+        self.top_p: float = gen.get("top_p", 1.0)
+        self.max_tokens: int = gen.get("max_tokens", 4096)
 
-        if not isinstance(data, dict):
-            raise ConfigError("Корень config.json должен быть объектом")
+        self.models: list[ModelInfo] = [
+            ModelInfo.from_dict(m) for m in raw.get("models", [])
+        ]
 
-        cfg = cls(path)
-
-        # Обязательные поля
-        for field_name in ("api_key", "api_base", "default_model"):
-            if field_name not in data:
-                raise ConfigError(f'отсутствует обязательное поле "{field_name}"')
-            if not isinstance(data[field_name], str):
-                raise ConfigError(
-                    f'поле "{field_name}" должно быть строкой, '
-                    f'получено "{type(data[field_name]).__name__}"'
-                )
-
-        cfg.api_key = data["api_key"]
-        cfg.api_base = data["api_base"]
-        cfg.default_model = data["default_model"]
-
-        if cfg.api_key.strip() in ("", "sk-YOUR-KEY-HERE"):
-            raise ConfigError("укажите реальный api_key в config.json")
-
-        # Опциональные верхнего уровня
-        cfg.system_prompt = data.get("system_prompt", "Ты полезный ассистент.")
-        if not isinstance(cfg.system_prompt, str):
-            raise ConfigError(
-                f'поле "system_prompt" должно быть строкой, '
-                f'получено "{type(cfg.system_prompt).__name__}"'
-            )
-
-        # Блок generation
-        gen = data.get("generation", {})
-        if not isinstance(gen, dict):
-            raise ConfigError('поле "generation" должно быть объектом')
-
-        def _num(field_name: str, default: float, typ: type) -> float:
-            val = gen.get(field_name, default)
-            if not isinstance(val, (int, float)) or isinstance(val, bool):
-                raise ConfigError(
-                    f'поле "{field_name}" должно быть числом, получено "{val}"'
-                )
-            return typ(val)
-
-        cfg.temperature = float(_num("temperature", 0.7, float))
-        cfg.top_p = float(_num("top_p", 1.0, float))
-        cfg.max_tokens = int(_num("max_tokens", 4096, int))
-
-        # Список моделей
-        raw_models = data.get("models", [])
-        if not isinstance(raw_models, list):
-            raise ConfigError('поле "models" должно быть массивом')
-
-        for idx, m in enumerate(raw_models):
-            if not isinstance(m, dict):
-                raise ConfigError(f"models[{idx}] должно быть объектом")
-            if "id" not in m:
-                raise ConfigError(f'models[{idx}]: отсутствует поле "id"')
-            cfg.models.append(ModelInfo(
-                id=str(m["id"]),
-                name=str(m.get("name", m["id"])),
-                context_window=int(m.get("context_window", 128000)),
-                supports_thinking=bool(m.get("supports_thinking", False)),
-                input_price_per_1m_tokens_rub=float(m.get("input_price_per_1m_tokens_rub", 0.0)),
-                output_price_per_1m_tokens_rub=float(m.get("output_price_per_1m_tokens_rub", 0.0)),
-            ))
-
-        return cfg
-
-    def get_model(self, model_id: str) -> Optional[ModelInfo]:
-        """Ищет модель по id (точное совпадение)."""
+    # ---- Поиск моделей ------------------------------------------------------
+    def find_model(self, model_id: str) -> Optional[ModelInfo]:
+        """Возвращает ModelInfo по точному id, либо None."""
         for m in self.models:
             if m.id == model_id:
                 return m
         return None
 
-    def find_models(self, query: str) -> list[ModelInfo]:
-        """Поиск моделей по id или name (частичное, case-insensitive)."""
-        q = query.lower().strip()
-        results = []
-        for m in self.models:
-            if q == m.id.lower() or q == m.name.lower():
-                return [m]  # Точное совпадение — возвращаем сразу
-            if q in m.id.lower() or q in m.name.lower():
-                results.append(m)
-        return results
+    def search_models(self, query: str) -> list[ModelInfo]:
+        """
+        Ищет модели по id или name (case-insensitive, частичное совпадение).
+        Если query — число, трактует как индекс (1-based) в списке моделей.
+        """
+        query = query.strip()
+        # Поиск по номеру
+        if query.isdigit():
+            idx = int(query) - 1
+            if 0 <= idx < len(self.models):
+                return [self.models[idx]]
+            return []
+        # Поиск по подстроке
+        q = query.lower()
+        # Сначала пытаемся найти точное совпадение
+        exact = [m for m in self.models if m.id.lower() == q or m.name.lower() == q]
+        if exact:
+            return exact
+        return [m for m in self.models if q in m.id.lower() or q in m.name.lower()]
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Управление историей сессий
-# ──────────────────────────────────────────────────────────────────────────────
-
-class HistoryManager:
-    """Сохранение/загрузка сессий чата в виде JSON-файлов."""
-
-    def __init__(self, history_dir: Path) -> None:
-        self.dir = history_dir
-        self.dir.mkdir(parents=True, exist_ok=True)
-
-    def save(self, session: Session) -> Path:
-        """Сохраняет сессию в файл {session_id}.json."""
-        path = self.dir / f"{session.session_id}.json"
-        path.write_text(
-            json.dumps(session.to_json(), ensure_ascii=False, indent=2),
-            encoding="utf-8"
+    # ---- Сохранение default_model -------------------------------------------
+    def set_default_model(self, model_id: str) -> None:
+        """
+        Записывает новый default_model в config.json, сохраняя остальные
+        поля и форматирование (отступы 2 пробела, как в шаблоне).
+        """
+        self.default_model = model_id
+        self._raw["default_model"] = model_id
+        CONFIG_PATH.write_text(
+            json.dumps(self._raw, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        return path
 
-    def list_sessions(self) -> list[Session]:
-        """Возвращает список всех сессий, отсортированных по дате (новые первыми)."""
-        sessions = []
-        for path in sorted(self.dir.glob("*.json"), reverse=True):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                sessions.append(Session.from_json(data))
-            except (json.JSONDecodeError, KeyError, OSError):
-                continue
-        return sessions
+    # ---- Фабрика ------------------------------------------------------------
+    @classmethod
+    def load(cls) -> "Config":
+        """
+        Загружает и валидирует конфиг.
+
+        Если файл отсутствует — создаёт шаблон и завершает работу (код 0).
+        При ошибках валидации поднимает ConfigError.
+        """
+        if not CONFIG_PATH.exists():
+            cls._create_template()
+            print(
+                f"Конфиг создан: {CONFIG_PATH}. Укажите api_key и запустите снова."
+            )
+            sys.exit(0)
+
+        # Парсинг JSON с указанием строки ошибки
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ConfigError(
+                f"Ошибка парсинга config.json (строка {e.lineno}): {e.msg}"
+            ) from e
+
+        cls._validate(raw)
+        return cls(raw)
+
+    @staticmethod
+    def _create_template() -> None:
+        """Создаёт файл config.json с дефолтными значениями."""
+        CONFIG_PATH.write_text(
+            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _validate(raw: dict[str, Any]) -> None:
+        """Проверяет наличие обязательных полей и корректность типов."""
+        # Обязательные поля
+        for field_name in Config.REQUIRED_FIELDS:
+            if field_name not in raw:
+                raise ConfigError(
+                    f'Ошибка конфига: отсутствует обязательное поле "{field_name}"'
+                )
+
+        # Типы обязательных полей
+        for field_name in Config.REQUIRED_FIELDS:
+            if not isinstance(raw[field_name], str):
+                raise ConfigError(
+                    f'Ошибка конфига: поле "{field_name}" должно быть строкой, '
+                    f'получено "{raw[field_name]}"'
+                )
+
+        # Типы необязательных полей (если присутствуют)
+        if "render_markdown" in raw and not isinstance(raw["render_markdown"], bool):
+            raise ConfigError(
+                f'Ошибка конфига: поле "render_markdown" должно быть булевым, '
+                f'получено "{raw["render_markdown"]}"'
+            )
+
+        if "system_prompt" in raw and not isinstance(raw["system_prompt"], str):
+            raise ConfigError(
+                f'Ошибка конфига: поле "system_prompt" должно быть строкой, '
+                f'получено "{raw["system_prompt"]}"'
+            )
+
+        gen = raw.get("generation", {})
+        if not isinstance(gen, dict):
+            raise ConfigError(
+                'Ошибка конфига: поле "generation" должно быть объектом'
+            )
+        if "temperature" in gen and not isinstance(gen["temperature"], (int, float)):
+            raise ConfigError(
+                f'Ошибка конфига: поле "temperature" должно быть числом, '
+                f'получено "{gen["temperature"]}"'
+            )
+        if "top_p" in gen and not isinstance(gen["top_p"], (int, float)):
+            raise ConfigError(
+                f'Ошибка конфига: поле "top_p" должно быть числом, '
+                f'получено "{gen["top_p"]}"'
+            )
+        if "max_tokens" in gen and not isinstance(gen["max_tokens"], int):
+            raise ConfigError(
+                f'Ошибка конфига: поле "max_tokens" должно быть целым числом, '
+                f'получено "{gen["max_tokens"]}"'
+            )
+
+        if "models" in raw and not isinstance(raw["models"], list):
+            raise ConfigError(
+                'Ошибка конфига: поле "models" должно быть списком'
+            )
+
+
+# ============================================================================
+# 5. КЛАСС HistoryManager — сохранение/загрузка сессий
+# ============================================================================
+class HistoryManager:
+    """
+    Управление историей сессий в каталоге ./history/.
+
+    Каждая сессия — отдельный JSON-файл с именем YYYYMMDD_HHMMSS.json.
+    """
+
+    def __init__(self) -> None:
+        HISTORY_DIR.mkdir(exist_ok=True)
+
+    def save(self, session: Session) -> None:
+        """Сохраняет сессию в файл (перезаписывает существующий)."""
+        # Не сохраняем пустые сессии (только system или вообще ничего)
+        non_system = [m for m in session.messages if m.role != "system"]
+        if not non_system:
+            return
+        path = HISTORY_DIR / f"{session.session_id}.json"
+        path.write_text(
+            json.dumps(session.to_json_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def load(self, session_id: str) -> Optional[Session]:
-        """Загружает сессию по id."""
-        path = self.dir / f"{session_id}.json"
+        """Загружает сессию по session_id (имя файла без .json)."""
+        path = HISTORY_DIR / f"{session_id}.json"
         if not path.exists():
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return Session.from_json(data)
-        except (json.JSONDecodeError, KeyError, OSError):
+        except (json.JSONDecodeError, OSError):
             return None
+        messages = [Message.from_json_dict(m) for m in data.get("messages", [])]
+        return Session(
+            session_id=data.get("session_id", ""),
+            created_at=data.get("created_at", ""),
+            default_model=data.get("default_model", ""),
+            messages=messages,
+        )
+
+    def list_sessions(self, limit: Optional[int] = 20) -> list[Session]:
+        """
+        Возвращает список сессий, отсортированных по дате (новые первыми).
+        Если limit задан — возвращает только последние limit штук.
+        """
+        files = sorted(
+            HISTORY_DIR.glob("*.json"),
+            key=lambda p: p.stem,
+            reverse=True,
+        )
+        sessions: list[Session] = []
+        for path in files:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            messages = [Message.from_json_dict(m) for m in data.get("messages", [])]
+            sessions.append(
+                Session(
+                    session_id=data.get("session_id", ""),
+                    created_at=data.get("created_at", ""),
+                    default_model=data.get("default_model", ""),
+                    messages=messages,
+                )
+            )
+        if limit is not None:
+            return sessions[:limit]
+        return sessions
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Подсчёт токенов и стоимости
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# 6. КЛАСС UsageTracker — глобальная статистика токенов
+# ============================================================================
+class UsageTracker:
+    """
+    Чтение и обновление накопительной статистики usage_stats.json
+    (суммарные токены, стоимость и число запросов за всё время).
+    """
 
-def estimate_tokens(text: str) -> int:
-    """Грубая оценка количества токенов (если API не вернул usage)."""
-    if not text:
-        return 0
-    # Если есть кириллица — делим на 2, иначе на 4
-    has_cyrillic = any('\u0400' <= ch <= '\u04FF' for ch in text)
-    return max(1, len(text) // (2 if has_cyrillic else 4))
+    def __init__(self) -> None:
+        self.data = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        """Загружает статистику из файла или возвращает пустую структуру."""
+        if not USAGE_STATS_PATH.exists():
+            return {
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "total_cost_rub": 0.0,
+                "total_requests": 0,
+                "updated_at": "",
+            }
+        try:
+            return json.loads(USAGE_STATS_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "total_cost_rub": 0.0,
+                "total_requests": 0,
+                "updated_at": "",
+            }
+
+    def add(self, prompt_tokens: int, completion_tokens: int, cost_rub: float) -> None:
+        """Добавляет данные одного запроса и сохраняет файл."""
+        self.data["total_prompt_tokens"] = (
+            self.data.get("total_prompt_tokens", 0) + prompt_tokens
+        )
+        self.data["total_completion_tokens"] = (
+            self.data.get("total_completion_tokens", 0) + completion_tokens
+        )
+        self.data["total_cost_rub"] = round(
+            self.data.get("total_cost_rub", 0.0) + cost_rub, 4
+        )
+        self.data["total_requests"] = self.data.get("total_requests", 0) + 1
+        self.data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save()
+
+    def _save(self) -> None:
+        """Записывает статистику в файл."""
+        USAGE_STATS_PATH.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
-def calculate_cost(prompt_tokens: int, completion_tokens: int, model: Optional[ModelInfo]) -> Optional[float]:
-    """Рассчитывает стоимость запроса в рублях. None если модель не известна."""
-    if model is None:
-        return None
-    cost = (
-        prompt_tokens * model.input_price_per_1m_tokens_rub / 1_000_000
-        + completion_tokens * model.output_price_per_1m_tokens_rub / 1_000_000
-    )
-    return cost
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Клиент чата — API + стриминг
-# ──────────────────────────────────────────────────────────────────────────────
-
-class ChatInterrupted(Exception):
-    """Стрим был прерван пользователем (Ctrl+C)."""
-
-
+# ============================================================================
+# 7. КЛАСС ChatClient — API-вызовы, стриминг, подсчёт токенов
+# ============================================================================
 @dataclass
 class StreamResult:
-    """Результат стриминга ответа модели."""
+    """Результат стриминга ответа."""
+
     content: str
     thinking: str
     prompt_tokens: int
@@ -404,48 +586,65 @@ class StreamResult:
 
 
 class ChatClient:
-    """Обёртка над OpenAI-клиентом со стримингом и обработкой ошибок."""
+    """
+    Клиент для общения с OpenAI-совместимым API.
+
+    Отвечает за стриминг ответов, обработку reasoning_content,
+    подсчёт токенов и расчёт стоимости.
+    """
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.client = OpenAI(api_key=config.api_key, base_url=config.api_base)
 
-    def stream_completion(
+    def update_provider(self, api_base: str, api_key: Optional[str] = None) -> None:
+        """Меняет провайдера (api_base/api_key) и пересоздаёт клиент."""
+        self.config.api_base = api_base
+        if api_key:
+            self.config.api_key = api_key
+        self.client = OpenAI(api_key=self.config.api_key, base_url=self.config.api_base)
+
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """
+        Грубая оценка количества токенов (fallback, если API не вернул usage).
+        Для текста с кириллицей — len/2, иначе len/4.
+        """
+        if not text:
+            return 0
+        has_cyrillic = any("\u0400" <= ch <= "\u04ff" for ch in text)
+        divisor = 2 if has_cyrillic else 4
+        return max(1, len(text) // divisor)
+
+    def calc_cost(
+        self, model: Optional[ModelInfo], prompt_tokens: int, completion_tokens: int
+    ) -> Optional[float]:
+        """
+        Рассчитывает стоимость в рублях по ценам модели.
+        Возвращает None, если у модели нет цен (модель не в списке).
+        """
+        if model is None or not model.has_pricing():
+            return None
+        cost = (
+            prompt_tokens * model.input_price_per_1m_tokens_rub / 1_000_000
+            + completion_tokens * model.output_price_per_1m_tokens_rub / 1_000_000
+        )
+        return cost
+
+    def stream(
         self,
-        model: str,
+        model_id: str,
         messages: list[dict[str, str]],
-        on_thinking: Optional[callable] = None,
-        on_content: Optional[callable] = None,
+        on_chunk: "Optional[callable]" = None,
     ) -> StreamResult:
         """
-        Делает стримящий запрос к API.
+        Выполняет стриминговый запрос к API.
 
-        on_thinking(text) — вызывается при получении нового куска reasoning
-        on_content(text)  — вызывается при получении нового куска ответа
+        on_chunk(content_so_far, thinking_so_far, completion_tokens) —
+        колбэк, вызываемый на каждый chunk для обновления Live.
+
+        Возвращает StreamResult. Обрабатывает прерывание Ctrl+C.
         """
-        # Подсчёт prompt-токенов как fallback (если API не вернёт usage)
-        prompt_text = "\n".join(m.get("content", "") for m in messages)
-        fallback_prompt_tokens = estimate_tokens(prompt_text)
-
-        # Параметры запроса
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": True,
-            "temperature": self.config.temperature,
-            "top_p": self.config.top_p,
-            "max_tokens": self.config.max_tokens,
-        }
-
-        # Пробуем включить usage в стриме (поддерживается не всеми API)
-        try:
-            kwargs_with_usage = dict(kwargs)
-            kwargs_with_usage["stream_options"] = {"include_usage": True}
-            stream = self.client.chat.completions.create(**kwargs_with_usage)
-        except TypeError:
-            # SDK не знает stream_options — повторяем без него
-            stream = self.client.chat.completions.create(**kwargs)
-
         content_parts: list[str] = []
         thinking_parts: list[str] = []
         prompt_tokens = 0
@@ -454,49 +653,82 @@ class ChatClient:
         interrupted = False
         start = time.monotonic()
 
+        # Пытаемся включить include_usage (поддерживается не всеми API)
+        create_kwargs: dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            "stream": True,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "max_tokens": self.config.max_tokens,
+        }
+        try:
+            create_kwargs["stream_options"] = {"include_usage": True}
+            stream = self.client.chat.completions.create(**create_kwargs)
+        except TypeError:
+            # API не поддерживает stream_options — убираем и пробуем снова
+            create_kwargs.pop("stream_options", None)
+            stream = self.client.chat.completions.create(**create_kwargs)
+
         try:
             for chunk in stream:
-                # Извлекаем usage если он есть
+                # Usage может прийти в последнем chunk'е
                 usage = getattr(chunk, "usage", None)
-                if usage is not None:
-                    prompt_tokens = getattr(usage, "prompt_tokens", 0) or prompt_tokens
-                    completion_tokens = getattr(usage, "completion_tokens", 0) or completion_tokens
-                    # reasoning_tokens может быть вложен в completion_tokens_details
+                if usage:
+                    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                    # reasoning-токены (если API сообщает)
                     details = getattr(usage, "completion_tokens_details", None)
-                    if details is not None:
-                        reasoning_tokens = getattr(details, "reasoning_tokens", 0) or reasoning_tokens
+                    if details:
+                        reasoning_tokens = (
+                            getattr(details, "reasoning_tokens", 0) or 0
+                        )
 
-                # Если нет choices — это финальный chunk только с usage
                 if not chunk.choices:
                     continue
 
                 delta = chunk.choices[0].delta
 
-                # Thinking / reasoning content
+                # reasoning_content — размышления (thinking)
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
                     thinking_parts.append(reasoning)
-                    if on_thinking:
-                        on_thinking(reasoning)
 
-                # Обычный контент
+                # Обычный контент ответа
                 if delta.content:
                     content_parts.append(delta.content)
-                    if on_content:
-                        on_content(delta.content)
 
+                # Колбэк для обновления Live
+                if on_chunk is not None:
+                    cur_completion = (
+                        completion_tokens
+                        if completion_tokens
+                        else self.estimate_tokens("".join(content_parts))
+                    )
+                    on_chunk(
+                        "".join(content_parts),
+                        "".join(thinking_parts),
+                        cur_completion,
+                    )
         except KeyboardInterrupt:
+            # Прерывание во время генерации — сохраняем фрагмент
             interrupted = True
+            try:
+                stream.close()
+            except Exception:
+                pass
 
         elapsed = time.monotonic() - start
         content = "".join(content_parts)
         thinking = "".join(thinking_parts)
 
-        # Fallback на оценку если usage не пришёл
+        # Fallback-подсчёт токенов, если API не вернул usage
         if prompt_tokens == 0:
-            prompt_tokens = fallback_prompt_tokens
+            prompt_tokens = sum(
+                self.estimate_tokens(m["content"]) for m in messages
+            )
         if completion_tokens == 0:
-            completion_tokens = estimate_tokens(content + thinking)
+            completion_tokens = self.estimate_tokens(content)
 
         return StreamResult(
             content=content,
@@ -509,506 +741,279 @@ class ChatClient:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Пользовательский интерфейс
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================================
+# 8. КЛАСС ChatUI — интерфейс (rich + prompt_toolkit)
+# ============================================================================
+class CommandCompleter(Completer):
+    """
+    Кастомный completer для команд и их аргументов.
+    Дополняет ввод, начинающийся с '/'.
+    """
+
+    def get_completions(self, document, complete_event):  # type: ignore[override]
+        text = document.text_before_cursor
+        # Автодополняем только команды (строки, начинающиеся с /)
+        if not text.startswith("/"):
+            return
+
+        parts = text.split()
+        # Дополнение имени команды
+        if len(parts) <= 1 and not text.endswith(" "):
+            word = parts[0] if parts else "/"
+            for cmd in COMMANDS:
+                if cmd.startswith(word):
+                    yield Completion(cmd, start_position=-len(word))
+            return
+
+        # Дополнение аргументов команды
+        cmd = parts[0]
+        args = COMMAND_ARGS.get(cmd, [])
+        if not args:
+            return
+        # Текущее слово (то, что после пробела)
+        current = "" if text.endswith(" ") else parts[-1]
+        for arg in args:
+            if arg.startswith(current):
+                yield Completion(arg, start_position=-len(current))
+
 
 class ChatUI:
-    """Основной класс UI: ввод, команды, рендеринг ответов."""
+    """
+    Терминальный интерфейс чата.
 
-    def __init__(self, config: Config, debug: bool = False) -> None:
+    Объединяет rich-вывод и prompt_toolkit-ввод, обрабатывает команды,
+    стриминг ответов, режим markdown (runtime-флаг) и автозавершение.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        client: ChatClient,
+        history_mgr: HistoryManager,
+        usage_tracker: UsageTracker,
+        markdown_enabled: bool,
+        debug: bool = False,
+    ) -> None:
         self.config = config
+        self.client = client
+        self.history_mgr = history_mgr
+        self.usage_tracker = usage_tracker
+        self.markdown_enabled = markdown_enabled  # runtime-флаг (не сохраняется)
         self.debug = debug
-        self.console = Console()
-        self.client = ChatClient(config)
-        self.history_mgr = HistoryManager(HISTORY_DIR)
-        self.current_model_id: str = config.default_model
-        self.session: Session = self._new_session()
-        self.input_session = self._build_prompt_session()
-        self.first_input = True  # Показывать ли подсказку под промптом
 
-    # ── Создание новой сессии ─────────────────────────────────────────────
+        self.console = Console()
+        self.current_model_id = config.default_model
+
+        # Статистика текущей сессии
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_cost = 0.0
+        self.session_requests = 0
+
+        # Флаг показа первой подсказки
+        self._hint_shown = False
+
+        # Создаём новую сессию
+        self.session = self._new_session()
+
+        # Настройка prompt_toolkit
+        self.prompt_session = self._build_prompt_session()
+
+    # ------------------------------------------------------------------ #
+    #  Создание сессии и prompt_toolkit
+    # ------------------------------------------------------------------ #
     def _new_session(self) -> Session:
+        """Создаёт новую сессию с system-сообщением."""
         now = datetime.now()
-        sid = now.strftime("%Y%m%d_%H%M%S")
-        sess = Session(
-            session_id=sid,
+        session_id = now.strftime("%Y%m%d_%H%M%S")
+        session = Session(
+            session_id=session_id,
             created_at=now.isoformat(timespec="seconds"),
             default_model=self.current_model_id,
-            messages=[Message(
-                role="system",
-                content=self.config.system_prompt,
-                timestamp=now.isoformat(timespec="seconds"),
-            )],
         )
-        return sess
+        # Добавляем system-сообщение
+        session.messages.append(
+            Message(role="system", content=self.config.system_prompt)
+        )
+        return session
 
-    # ── prompt_toolkit конфигурация ───────────────────────────────────────
     def _build_prompt_session(self) -> PromptSession:
-        """Создаёт сессию ввода с биндингами Enter / Alt+Enter."""
+        """Настраивает PromptSession с историей, автодополнением и хоткеями."""
+        history = FileHistory(str(INPUT_HISTORY_PATH))
+
+        # Биндинги: Enter — новая строка, Ctrl+Enter — отправка
         kb = KeyBindings()
 
-        @kb.add("enter")
-        def _(event):
-            # Enter = новая строка
+        @kb.add("c-m")  # Enter (carriage return)
+        def _(event) -> None:
+            """Enter вставляет перевод строки."""
             event.current_buffer.insert_text("\n")
 
-        @kb.add("escape", "enter")
-        def _(event):
-            # Alt+Enter (Esc → Enter) = отправка
+        @kb.add("c-j")  # Ctrl+Enter в большинстве терминалов даёт c-j
+        def _(event) -> None:
+            """Ctrl+Enter отправляет сообщение."""
             event.current_buffer.validate_and_handle()
 
-        # На некоторых терминалах Alt+Enter присылается как этот код
-        @kb.add("c-j")  # Ctrl+J — fallback (как на некоторых системах Alt+Enter)
-        def _(event):
-            event.current_buffer.validate_and_handle()
-
-        style = PTStyle.from_dict({
-            "prompt": "bold cyan",
-        })
+        # Объединяем команды и историю в один completer
+        completer = merge_completers([CommandCompleter()])
 
         return PromptSession(
+            history=history,
+            completer=completer,
+            auto_suggest=AutoSuggestFromHistory(),
             multiline=True,
             key_bindings=kb,
-            history=InMemoryHistory(),
-            style=style,
+            complete_while_typing=True,
         )
 
-    # ── Утилиты вывода ────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    #  Утилиты модели
+    # ------------------------------------------------------------------ #
     def _current_model_info(self) -> Optional[ModelInfo]:
-        return self.config.get_model(self.current_model_id)
+        """Возвращает ModelInfo текущей модели (или None)."""
+        return self.config.find_model(self.current_model_id)
 
-    def _current_model_label(self) -> str:
-        m = self._current_model_info()
-        return m.name if m else self.current_model_id
+    def _model_display_name(self, model_id: Optional[str] = None) -> str:
+        """Возвращает name модели (или id, если не найдена)."""
+        mid = model_id or self.current_model_id
+        info = self.config.find_model(mid)
+        return info.name if info else mid
 
+    # ------------------------------------------------------------------ #
+    #  Баннер и разделители
+    # ------------------------------------------------------------------ #
     def show_banner(self) -> None:
-        """Стартовый баннер."""
-        label = self._current_model_label()
+        """Выводит стартовую панель с названием модели."""
+        name = self._model_display_name()
         text = Text()
-        text.append("🤖 AI Chat", style="bold cyan")
-        text.append(f"  │  Модель: ", style="dim")
-        text.append(label, style="bold green")
-        text.append("\n")
+        text.append("🤖 AI Chat │ ", style="bold cyan")
+        text.append(f"Модель: {name}\n", style="bold cyan")
         text.append("Введите /help для списка команд", style="dim")
-        self.console.print(Panel(text, border_style="cyan"))
+        panel = Panel(text, border_style="cyan", expand=True)
+        self.console.print(panel)
 
-    def show_error(self, message: str, title: str = "Ошибка") -> None:
-        """Показывает ошибку в красной панели."""
-        self.console.print(Panel(
-            Text(message, style="bold red"),
-            title=title,
-            border_style="red"
-        ))
-
-    def show_info(self, message: str) -> None:
-        """Информационное сообщение dim-стилем."""
-        self.console.print(Text(message, style="dim"))
-
-    # ── Сохранение сессии ─────────────────────────────────────────────────
-    def save_session(self) -> None:
-        """Сохраняет текущую сессию, если в ней есть содержательные сообщения."""
-        # Не сохраняем сессии без юзерских/ассистентских сообщений
-        non_system = [m for m in self.session.messages if m.role != "system"]
-        if not non_system:
-            return
-        try:
-            self.history_mgr.save(self.session)
-        except OSError as e:
-            self.show_error(f"Не удалось сохранить сессию: {e}")
-
-    # ── Главный цикл ──────────────────────────────────────────────────────
-    def run(self) -> None:
-        """Главный цикл REPL."""
-        self.show_banner()
-
-        # Предупреждение если модель не в списке
-        if self._current_model_info() is None and self.config.models:
-            self.show_info(
-                f"Предупреждение: модель {self.current_model_id} не найдена в списке models. "
-                "Стоимость не будет рассчитываться."
-            )
-
-        while True:
-            try:
-                user_input = self._read_input()
-            except (KeyboardInterrupt, EOFError):
-                self.console.print()
-                self._exit_gracefully()
-                return
-
-            if user_input is None:
-                continue
-
-            stripped = user_input.strip()
-            if not stripped:
-                continue  # Пустой ввод — игнорируем
-
-            # Команды
-            if stripped.startswith("/"):
-                should_continue = self._handle_command(stripped)
-                if not should_continue:
-                    return
-                continue
-
-            # Обычное сообщение
-            self._send_message(user_input)
-
-    def _read_input(self) -> Optional[str]:
-        """Читает многострочный ввод от пользователя."""
-        label = self._current_model_label()
-        prompt_html = HTML(f'\n<prompt>[{label}] Вы ›</prompt> ')
-
-        # Подсказка только при первом вводе
-        if self.first_input:
-            self.console.print(
-                Text("(Alt+Enter — отправить, /help — справка)", style="dim italic")
-            )
-
-        try:
-            text = self.input_session.prompt(prompt_html)
-        except KeyboardInterrupt:
-            raise
-        except EOFError:
-            raise
-
-        self.first_input = False
-        return text
-
-    # ── Команды ───────────────────────────────────────────────────────────
-    def _handle_command(self, cmd_line: str) -> bool:
-        """
-        Обработка команд. Возвращает False если нужно выйти из main loop.
-        """
-        parts = cmd_line.split(maxsplit=1)
-        cmd = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
-
-        if cmd == "/exit":
-            self._exit_gracefully()
-            return False
-        elif cmd == "/help":
-            self._cmd_help()
-        elif cmd == "/new":
-            self._cmd_new()
-        elif cmd == "/history":
-            self._cmd_history(arg)
-        elif cmd == "/model":
-            self._cmd_model(arg)
-        elif cmd == "/file":
-            self._cmd_file(arg)
-        elif cmd == "/clear":
-            self.console.clear()
-            self.show_banner()
-        elif cmd == "/usage":
-            self._cmd_usage()
-        else:
-            self.show_info(f"Неизвестная команда: {cmd}. Введите /help для справки.")
-
-        return True
-
-    def _cmd_help(self) -> None:
-        """Вывод справки по командам."""
-        table = Table(title="Команды", border_style="cyan", show_lines=False)
-        table.add_column("Команда", style="bold yellow", no_wrap=True)
-        table.add_column("Описание", style="white")
-        table.add_row("/new", "Начать новый разговор (текущий сохранится)")
-        table.add_row("/history [all]", "Список сохранённых сессий (последние 20 / все)")
-        table.add_row("/model", "Выбор модели из списка")
-        table.add_row("/model <имя|№>", "Быстрое переключение модели")
-        table.add_row("/file <путь>", "Отправить содержимое текстового файла")
-        table.add_row("/clear", "Очистить экран (контекст сохранится)")
-        table.add_row("/usage", "Статистика по текущей сессии")
-        table.add_row("/help", "Эта справка")
-        table.add_row("/exit", "Выход с сохранением сессии")
-        self.console.print(table)
-        self.console.print(
-            Text(
-                "\nВвод: Enter — новая строка, Alt+Enter — отправить сообщение.\n"
-                "Прерывание генерации: Ctrl+C.",
-                style="dim"
-            )
-        )
-
-    def _cmd_new(self) -> None:
-        """Сохранить текущую сессию и начать новую."""
-        self.save_session()
-        self.session = self._new_session()
-        self.console.print(Text("Сессия сохранена. Новый разговор начат.", style="dim green"))
-
-    def _cmd_history(self, arg: str) -> None:
-        """Список сессий и загрузка выбранной."""
-        sessions = self.history_mgr.list_sessions()
-        if not sessions:
-            self.show_info("История пуста.")
-            return
-
-        show_all = arg.strip().lower() == "all"
-        display = sessions if show_all else sessions[:20]
-
-        table = Table(title=f"Сохранённые сессии ({len(display)} из {len(sessions)})", border_style="cyan")
-        table.add_column("№", style="bold yellow", justify="right")
-        table.add_column("Дата", style="cyan")
-        table.add_column("Модель", style="green")
-        table.add_column("Первое сообщение", style="white")
-
-        for idx, s in enumerate(display, 1):
-            first_user = next((m.content for m in s.messages if m.role == "user"), "")
-            preview = first_user.replace("\n", " ").strip()
-            if len(preview) > 60:
-                preview = preview[:57] + "..."
-            try:
-                dt = datetime.fromisoformat(s.created_at).strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                dt = s.created_at
-            table.add_row(str(idx), dt, s.default_model or "—", preview or "(пусто)")
-
-        self.console.print(table)
-
-        try:
-            choice = self.console.input("\n[dim]Номер для загрузки (Enter — отмена): [/dim]").strip()
-        except (EOFError, KeyboardInterrupt):
-            self.console.print()
-            return
-
-        if not choice:
-            return
-
-        try:
-            idx = int(choice)
-            if not 1 <= idx <= len(display):
-                self.show_info("Неверный номер.")
-                return
-        except ValueError:
-            self.show_info("Нужно ввести число.")
-            return
-
-        # Сохраняем текущую, загружаем выбранную
-        self.save_session()
-        self.session = display[idx - 1]
-        if self.session.default_model:
-            self.current_model_id = self.session.default_model
-        self.console.print(Text(f"Загружена сессия от {self.session.created_at}", style="dim green"))
-        self._render_loaded_session()
-
-    def _render_loaded_session(self) -> None:
-        """Краткий вывод загруженной сессии."""
-        for m in self.session.messages:
-            if m.role == "system":
-                continue
-            self.console.print(Rule(style="dim"))
-            if m.role == "user":
-                self.console.print(Text(f"Вы:", style="bold cyan"))
-                self.console.print(m.content)
-            elif m.role == "assistant":
-                model_label = m.model or "Ассистент"
-                self.console.print(Text(f"🤖 {model_label}", style="bold green"))
-                self.console.print(Markdown(m.content))
+    def _rule(self) -> None:
+        """Печатает горизонтальный разделитель."""
         self.console.print(Rule(style="dim"))
 
-    def _cmd_model(self, arg: str) -> None:
-        """Переключение модели."""
-        if not self.config.models:
-            self.show_info("Список моделей пуст. Добавьте модели в config.json.")
-            return
-
-        if arg.strip():
-            # Быстрое переключение
-            query = arg.strip()
-            # Сначала пытаемся как номер
-            try:
-                idx = int(query)
-                if 1 <= idx <= len(self.config.models):
-                    self._switch_model(self.config.models[idx - 1])
-                    return
-            except ValueError:
-                pass
-
-            matches = self.config.find_models(query)
-            if len(matches) == 0:
-                self.show_info(f"Модель не найдена: {query}")
-            elif len(matches) == 1:
-                self._switch_model(matches[0])
-            else:
-                self.show_info("Найдено несколько моделей, уточните:")
-                for m in matches:
-                    self.console.print(f"  • {m.name} ({m.id})")
-            return
-
-        # Интерактивный выбор
-        table = Table(title="Доступные модели", border_style="cyan")
-        table.add_column("№", style="bold yellow", justify="right")
-        table.add_column("Имя", style="green")
-        table.add_column("ID", style="dim")
-        table.add_column("Контекст", justify="right")
-        table.add_column("Thinking", justify="center")
-
-        for i, m in enumerate(self.config.models, 1):
-            marker = " ←" if m.id == self.current_model_id else ""
-            table.add_row(
-                str(i),
-                m.name + marker,
-                m.id,
-                f"{m.context_window:,}".replace(",", " "),
-                "✓" if m.supports_thinking else "—"
-            )
-
-        self.console.print(table)
-        try:
-            choice = self.console.input("\n[dim]Номер модели (Enter — отмена): [/dim]").strip()
-        except (EOFError, KeyboardInterrupt):
-            self.console.print()
-            return
-
-        if not choice:
-            return
-
-        try:
-            idx = int(choice)
-            if not 1 <= idx <= len(self.config.models):
-                self.show_info("Неверный номер.")
-                return
-        except ValueError:
-            self.show_info("Нужно ввести число.")
-            return
-
-        self._switch_model(self.config.models[idx - 1])
-
-    def _switch_model(self, model: ModelInfo) -> None:
-        """Переключиться на указанную модель."""
-        self.current_model_id = model.id
-        self.console.print(Text(f"Модель переключена на {model.name}", style="dim green"))
-
-    def _cmd_file(self, arg: str) -> None:
-        """Отправка содержимого файла как сообщения."""
-        if not arg.strip():
-            self.show_info("Использование: /file <путь>")
-            return
-
-        path = Path(arg.strip().strip('"').strip("'"))
-        if not path.exists():
-            self.show_error(f"Файл не найден: {path}")
-            return
-        if not path.is_file():
-            self.show_error(f"Не является файлом: {path}")
-            return
-
-        try:
-            size = path.stat().st_size
-        except OSError as e:
-            self.show_error(f"Не удалось получить размер файла: {e}")
-            return
-
-        if size > MAX_FILE_SIZE:
-            self.show_error(f"Файл слишком большой ({size} байт). Лимит: {MAX_FILE_SIZE} байт.")
-            return
-
-        try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as e:
-            self.show_error(
-                f"Не удалось прочитать файл: {e}. Убедитесь что файл в кодировке UTF-8."
-            )
-            return
-        except OSError as e:
-            self.show_error(f"Не удалось прочитать файл: {e}")
-            return
-
-        # Превью
-        preview_lines = content.splitlines()[:3]
-        preview = "\n".join(preview_lines)
-        if len(content.splitlines()) > 3:
-            preview += "\n..."
-
-        self.console.print(Panel(
-            preview,
-            title=f"Превью: {path.name} ({size} байт)",
-            border_style="cyan"
-        ))
-
-        try:
-            answer = self.console.input("[dim]Отправить содержимое в чат? (y/n): [/dim]").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            self.console.print()
-            return
-
-        if answer not in ("y", "yes", "д", "да"):
-            self.show_info("Отменено.")
-            return
-
-        message = f"Содержимое файла `{path.name}`:\n\n```\n{content}\n```"
-        self._send_message(message)
-
-    def _cmd_usage(self) -> None:
-        """Статистика по сессии."""
-        total_prompt = 0
-        total_completion = 0
-        total_cost = 0.0
-        cost_known = True
-        requests = 0
-
-        for m in self.session.messages:
-            if m.role == "assistant" and m.usage:
-                requests += 1
-                total_prompt += m.usage.get("prompt_tokens", 0)
-                total_completion += m.usage.get("completion_tokens", 0)
-                model_info = self.config.get_model(m.model or "")
-                c = calculate_cost(
-                    m.usage.get("prompt_tokens", 0),
-                    m.usage.get("completion_tokens", 0),
-                    model_info
-                )
-                if c is None:
-                    cost_known = False
-                else:
-                    total_cost += c
-
-        table = Table(title="Статистика сессии", border_style="cyan")
-        table.add_column("Метрика", style="dim")
-        table.add_column("Значение", style="bold green", justify="right")
-        table.add_row("Запросов", str(requests))
-        table.add_row("Prompt токенов", f"{total_prompt:,}".replace(",", " "))
-        table.add_row("Completion токенов", f"{total_completion:,}".replace(",", " "))
-        table.add_row("Всего токенов", f"{total_prompt + total_completion:,}".replace(",", " "))
-        if cost_known and requests > 0:
-            table.add_row("Общая стоимость", f"{total_cost:.4f}₽")
-            table.add_row("Средняя/запрос", f"{total_cost / requests:.4f}₽")
-        else:
-            table.add_row("Общая стоимость", "—")
-        self.console.print(table)
-
-    # ── Отправка сообщения и стриминг ─────────────────────────────────────
-    def _send_message(self, content: str) -> None:
-        """Отправка сообщения пользователя и получение ответа."""
-        # Добавляем сообщение пользователя
-        user_msg = Message(
-            role="user",
-            content=content,
-            timestamp=datetime.now().isoformat(timespec="seconds"),
+    # ------------------------------------------------------------------ #
+    #  Вывод ошибок
+    # ------------------------------------------------------------------ #
+    def show_error(self, message: str, exc: Optional[Exception] = None) -> None:
+        """Выводит ошибку в красной панели; traceback — в stderr при --debug."""
+        panel = Panel(
+            Text(message, style="bold red"),
+            title="Ошибка",
+            border_style="red",
         )
-        self.session.messages.append(user_msg)
+        self.console.print(panel)
+        if self.debug and exc is not None:
+            import traceback
 
-        # Проверка контекста
-        self._check_context_size()
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
 
-        # Подготовка истории для API (без thinking, без служебных полей)
-        api_messages = [m.to_api_dict() for m in self.session.messages]
+    def show_info(self, message: str) -> None:
+        """Выводит информационное сообщение тусклым стилем."""
+        self.console.print(message, style="dim")
+
+    # ------------------------------------------------------------------ #
+    #  Рендеринг ответа (две ветки: plain / markdown)
+    # ------------------------------------------------------------------ #
+    def render_response(self, text: str):
+        """
+        Возвращает рендерабл для текста ответа в зависимости от режима.
+
+        - markdown ВЫКЛ: Text без markup и подсветки (plain).
+        - markdown ВКЛ: Markdown.
+        """
+        if self.markdown_enabled:
+            return Markdown(text)
+        return Text(text, no_wrap=False)
+
+    # ------------------------------------------------------------------ #
+    #  Строка статистики
+    # ------------------------------------------------------------------ #
+    def _build_stats_line(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        reasoning_tokens: int,
+        cost: Optional[float],
+        elapsed: float,
+        streaming: bool = False,
+    ) -> Text:
+        """Собирает строку статистики ответа (dim cyan)."""
+        suffix = "..." if streaming else ""
+        tilde = "~" if streaming else ""
+
+        line = Text(style="dim cyan")
+        line.append("⏱ Токены: ")
+        line.append(f"↑{prompt_tokens} ↓{completion_tokens}{suffix}")
+        if reasoning_tokens > 0:
+            line.append(f" (💭{reasoning_tokens})")
+        line.append(" │ ")
+        if cost is None:
+            line.append("💰 —")
+        else:
+            line.append(f"💰 {tilde}{cost:.4f}₽")
+        line.append(" │ ")
+        line.append(f"⏳ {elapsed:.1f}с")
+        return line
+
+    # ------------------------------------------------------------------ #
+    #  Отправка сообщения и стриминг ответа
+    # ------------------------------------------------------------------ #
+    def send_message(self, user_text: str) -> None:
+        """
+        Добавляет сообщение пользователя, выполняет запрос со стримингом,
+        выводит ответ и обновляет статистику.
+        """
+        # Добавляем сообщение пользователя в сессию
+        self.session.messages.append(Message(role="user", content=user_text))
+
+        # Проверка контекста перед отправкой
+        self._check_context()
 
         model_info = self._current_model_info()
+        model_name = self._model_display_name()
 
-        # Стриминг с retry
-        result = self._stream_with_retry(api_messages, model_info)
+        # Формируем сообщения для API (без thinking)
+        api_messages = [m.to_api_dict() for m in self.session.messages]
 
+        # Заголовок ответа
+        self._rule()
+        self.console.print(f"🤖 {model_name}", style="bold green")
+        self.console.print()
+
+        # Стриминг с Live
+        result = self._stream_with_retry(model_info, api_messages, model_name)
         if result is None:
-            # Окончательная неудача — откатываем добавленное сообщение пользователя
-            # (но если это был /file — пользователь это понимает; оставим как есть)
+            # Запрос не удался — удаляем добавленное user-сообщение из истории API,
+            # но оставляем в сессии (пользователь видит свой ввод)
             return
 
-        # Сохраняем ответ ассистента
+        # Считаем стоимость
+        cost = self.client.calc_cost(
+            model_info, result.prompt_tokens, result.completion_tokens
+        )
+
+        # Финальная строка статистики
+        stats = self._build_stats_line(
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.reasoning_tokens,
+            cost,
+            result.elapsed,
+            streaming=False,
+        )
+        self.console.print()
+        self.console.print(stats)
+        self._rule()
+
+        # Сохраняем ответ в сессию
         assistant_msg = Message(
             role="assistant",
             content=result.content,
-            timestamp=datetime.now().isoformat(timespec="seconds"),
             model=self.current_model_id,
             thinking=result.thinking if result.thinking else None,
             usage={
@@ -1019,353 +1024,853 @@ class ChatUI:
         )
         self.session.messages.append(assistant_msg)
 
-        # Автосохранение
-        self.save_session()
+        # Обновляем статистику сессии
+        self.session_prompt_tokens += result.prompt_tokens
+        self.session_completion_tokens += result.completion_tokens
+        if cost is not None:
+            self.session_cost += cost
+        self.session_requests += 1
+
+        # Обновляем глобальную статистику
+        self.usage_tracker.add(
+            result.prompt_tokens,
+            result.completion_tokens,
+            cost if cost is not None else 0.0,
+        )
+
+        # Автосохранение сессии
+        self.history_mgr.save(self.session)
 
     def _stream_with_retry(
         self,
-        api_messages: list[dict[str, str]],
         model_info: Optional[ModelInfo],
+        api_messages: list[dict[str, str]],
+        model_name: str,
     ) -> Optional[StreamResult]:
-        """Выполняет стриминг с retry при сетевых ошибках."""
-        last_error: Optional[str] = None
+        """
+        Выполняет стриминг с обработкой ошибок и повторными попытками.
+        Возвращает StreamResult или None при неустранимой ошибке.
+        """
+        supports_thinking = model_info.supports_thinking if model_info else False
 
-        for attempt in range(MAX_RETRIES):
+        attempt = 0
+        delay = 1.0
+        while attempt < MAX_RETRIES:
+            attempt += 1
             try:
-                return self._do_stream(api_messages, model_info)
-            except APIStatusError as e:
-                status = getattr(e, "status_code", None)
-                if status == 401:
-                    self.show_error("Неверный API-ключ. Проверьте поле api_key в config.json")
-                    return None
-                elif status == 429:
-                    # Rate limit — ждём
-                    retry_after = self._parse_retry_after(e)
-                    self.show_info(f"Превышен лимит. Повтор через {retry_after}с...")
-                    try:
-                        time.sleep(retry_after)
-                    except KeyboardInterrupt:
-                        return None
-                    continue
-                elif status == 400:
-                    # Возможно — превышен контекст
-                    msg = str(e).lower()
-                    if "context" in msg or "length" in msg or "too long" in msg or "maximum" in msg:
-                        return self._handle_context_overflow(api_messages, model_info)
-                    self.show_error(f"Ошибка запроса (400): {e}")
-                    return None
-                elif status and status >= 500:
-                    last_error = f"Ошибка сервера ({status})"
-                    self.show_info(f"{last_error}. Повтор...")
-                else:
-                    self.show_error(f"Ошибка API ({status}): {e}")
-                    return None
-            except (APIConnectionError, APITimeoutError) as e:
-                last_error = f"Сетевая ошибка: {e}"
-            except RateLimitError as e:
-                self.show_info(f"Превышен лимит запросов. Повтор...")
-                last_error = str(e)
-            except Exception as e:
-                if self.debug:
-                    traceback.print_exc(file=sys.stderr)
-                self.show_error(f"Непредвиденная ошибка: {e}")
+                return self._do_stream(api_messages, supports_thinking, model_info)
+            except AuthenticationError as e:
+                self.show_error(
+                    "Неверный API-ключ. Проверьте поле api_key в config.json", e
+                )
                 return None
-
-            # Пауза перед следующей попыткой
-            if attempt < MAX_RETRIES - 1:
-                delay = RETRY_DELAYS[attempt]
-                self.show_info(f"Повторная попытка {attempt + 2}/{MAX_RETRIES} через {delay}с...")
-                try:
-                    time.sleep(delay)
-                except KeyboardInterrupt:
+            except RateLimitError as e:
+                retry_after = self._extract_retry_after(e)
+                self.show_info(f"Превышен лимит. Повтор через {retry_after}с...")
+                time.sleep(retry_after)
+                continue
+            except APIStatusError as e:
+                code = getattr(e, "status_code", 0)
+                if code == 400 and self._is_context_error(e):
+                    handled = self._handle_context_overflow(model_info)
+                    if handled:
+                        # Повторяем с обрезанным контекстом
+                        api_messages = [
+                            m.to_api_dict() for m in self.session.messages
+                        ]
+                        continue
                     return None
-
-        self.show_error(f"Не удалось выполнить запрос после {MAX_RETRIES} попыток. {last_error or ''}")
+                if code >= 500:
+                    self.show_info(f"Ошибка сервера ({code}). Повтор через {delay:.0f}с...")
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                self.show_error(f"Ошибка API ({code}): {e}", e)
+                return None
+            except (APIConnectionError, APITimeoutError) as e:
+                if attempt < MAX_RETRIES:
+                    self.show_info(
+                        f"Повторная попытка {attempt + 1}/{MAX_RETRIES} "
+                        f"через {delay:.0f}с..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                self.show_error(f"Сетевая ошибка: {e}", e)
+                return None
+            except Exception as e:  # неожиданная ошибка
+                self.show_error(f"Непредвиденная ошибка: {e}", e)
+                return None
+        self.show_error("Превышено число повторных попыток.")
         return None
-
-    def _parse_retry_after(self, error: APIStatusError) -> int:
-        """Извлекает Retry-After из заголовков ответа."""
-        try:
-            response = getattr(error, "response", None)
-            if response is not None:
-                ra = response.headers.get("retry-after") or response.headers.get("Retry-After")
-                if ra:
-                    return int(float(ra))
-        except (AttributeError, ValueError, TypeError):
-            pass
-        return 5  # Дефолт
-
-    def _handle_context_overflow(
-        self,
-        api_messages: list[dict[str, str]],
-        model_info: Optional[ModelInfo],
-    ) -> Optional[StreamResult]:
-        """Обработка ошибки превышения контекста."""
-        window = model_info.context_window if model_info else 128000
-        self.show_error(
-            f"Превышен контекст модели ({window} токенов). Используйте /new для нового разговора."
-        )
-        try:
-            answer = self.console.input(
-                "[dim]Удалить старые сообщения и повторить? (y/n): [/dim]"
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            self.console.print()
-            return None
-
-        if answer not in ("y", "yes", "д", "да"):
-            return None
-
-        # Удаляем самые старые non-system сообщения (по парам)
-        trimmed = False
-        while len(self.session.messages) > 3:  # Оставляем хотя бы system + последний user
-            # Найти первый non-system и удалить его
-            for i, m in enumerate(self.session.messages):
-                if m.role != "system":
-                    del self.session.messages[i]
-                    trimmed = True
-                    break
-            # Удалим ещё одно сообщение (по парам user/assistant)
-            for i, m in enumerate(self.session.messages):
-                if m.role != "system":
-                    del self.session.messages[i]
-                    break
-
-            # Пересобираем и пробуем снова
-            new_api_messages = [m.to_api_dict() for m in self.session.messages]
-            if estimate_tokens("\n".join(x.get("content", "") for x in new_api_messages)) < window * 0.7:
-                api_messages = new_api_messages
-                break
-
-        if not trimmed:
-            return None
-
-        self.show_info("Старые сообщения удалены. Повторный запрос...")
-        try:
-            return self._do_stream(api_messages, model_info)
-        except Exception as e:
-            self.show_error(f"Повторный запрос не удался: {e}")
-            return None
 
     def _do_stream(
         self,
         api_messages: list[dict[str, str]],
+        supports_thinking: bool,
         model_info: Optional[ModelInfo],
     ) -> StreamResult:
-        """Запускает стриминг с Live-обновлением UI."""
-        self.console.print(Rule(style="dim"))
+        """Выполняет один проход стриминга с Live-обновлением."""
+        # Флаг: выводили ли заголовок "Размышляю..."
+        state = {"thinking_header": False}
 
-        # Состояние для рендеринга
-        state = {
-            "content": "",
-            "thinking": "",
-            "completion_tokens": 0,
-            "prompt_tokens": 0,
-        }
-        start_ts = time.monotonic()
-        model_label = self._current_model_label()
-        supports_thinking = model_info.supports_thinking if model_info else False
+        # Используем Live для обновления текста ответа в реальном времени
+        with Live(
+            console=self.console,
+            refresh_per_second=12,
+            transient=False,
+        ) as live:
 
-        def render() -> Group:
-            """Собирает текущее представление ответа."""
-            blocks = []
+            def on_chunk(content: str, thinking: str, completion_tokens: int) -> None:
+                """Колбэк обновления Live на каждый chunk."""
+                renderables: list[Any] = []
 
-            # Блок thinking
-            if state["thinking"]:
-                blocks.append(Text("💭 Размышляю...", style="bold dim"))
-                blocks.append(Text(state["thinking"], style="dim italic"))
-                blocks.append(Text(""))  # пустая строка
+                # Блок thinking (всегда plain, dim italic)
+                if thinking:
+                    think_text = Text(style="dim italic")
+                    think_text.append("💭 Размышляю...\n")
+                    # Отступ для строк размышлений
+                    for ln in thinking.splitlines():
+                        think_text.append(f"   {ln}\n")
+                    renderables.append(think_text)
+                    if content:
+                        renderables.append(Text(""))  # отступ
 
-            # Блок ответа
-            if state["content"] or not state["thinking"]:
-                blocks.append(Text(f"🤖 {model_label}", style="bold green"))
-                blocks.append(Text(""))
-                if state["content"]:
-                    blocks.append(Markdown(state["content"]))
+                # Текст ответа
+                if content:
+                    renderables.append(self.render_response(content))
 
-            # Статистика
-            elapsed = time.monotonic() - start_ts
-            up = state["prompt_tokens"]
-            down = state["completion_tokens"]
-            cost = calculate_cost(up, down, model_info)
-            up_str = f"↑{up}" if up else "↑?"
-            down_str = f"↓{down}..."
+                # Строка статистики (streaming)
+                prompt_est = (
+                    self.client.estimate_tokens(
+                        "".join(m["content"] for m in api_messages)
+                    )
+                )
+                stats = self._build_stats_line(
+                    prompt_est,
+                    completion_tokens,
+                    0,
+                    None,  # стоимость не показываем в процессе (или ~)
+                    0.0,
+                    streaming=True,
+                )
+                renderables.append(Text(""))
+                renderables.append(stats)
 
-            if cost is not None:
-                cost_str = f"~{cost:.4f}₽"
-            else:
-                cost_str = "—"
+                # Собираем группу
+                from rich.console import Group
 
-            stats = Text(
-                f"\n ⏱ Токены: {up_str} {down_str}  │  💰 {cost_str}  │  ⏳ {elapsed:.1f}с",
-                style="dim cyan"
+                live.update(Group(*renderables))
+
+            result = self.client.stream(
+                self.current_model_id, api_messages, on_chunk=on_chunk
             )
-            blocks.append(stats)
 
-            return Group(*blocks)
+            # Финальное обновление Live без индикаторов стриминга
+            renderables: list[Any] = []
+            if result.thinking:
+                think_text = Text(style="dim italic")
+                think_text.append("💭 Размышляю...\n")
+                for ln in result.thinking.splitlines():
+                    think_text.append(f"   {ln}\n")
+                renderables.append(think_text)
+                renderables.append(Text(""))
+            if result.content:
+                renderables.append(self.render_response(result.content))
+            from rich.console import Group
 
-        completion_chunks = 0
-        interrupted = False
-        result: Optional[StreamResult] = None
+            live.update(Group(*renderables) if renderables else Text(""))
 
+        return result
+
+    @staticmethod
+    def _extract_retry_after(exc: Exception) -> int:
+        """Извлекает Retry-After из заголовков ошибки 429 (по умолчанию 5с)."""
         try:
-            with Live(render(), console=self.console, refresh_per_second=12, transient=False) as live:
-                def on_thinking(text: str) -> None:
-                    state["thinking"] += text
-                    live.update(render())
+            response = getattr(exc, "response", None)
+            if response is not None:
+                headers = getattr(response, "headers", {})
+                ra = headers.get("Retry-After") or headers.get("retry-after")
+                if ra:
+                    return int(float(ra))
+        except (ValueError, AttributeError):
+            pass
+        return 5
 
-                def on_content(text: str) -> None:
-                    nonlocal completion_chunks
-                    state["content"] += text
-                    completion_chunks += 1
-                    # Грубая оценка во время стриминга
-                    state["completion_tokens"] = estimate_tokens(state["content"] + state["thinking"])
-                    live.update(render())
+    @staticmethod
+    def _is_context_error(exc: Exception) -> bool:
+        """Определяет, связана ли ошибка 400 с превышением контекста."""
+        msg = str(exc).lower()
+        return "context" in msg or "maximum" in msg or "token" in msg
 
-                # Запускаем стрим
-                try:
-                    result = self.client.stream_completion(
-                        model=self.current_model_id,
-                        messages=api_messages,
-                        on_thinking=on_thinking,
-                        on_content=on_content,
-                    )
-                    # Обновляем точные токены если пришли в usage
-                    state["prompt_tokens"] = result.prompt_tokens
-                    state["completion_tokens"] = result.completion_tokens
-                    interrupted = result.interrupted
-                except KeyboardInterrupt:
-                    interrupted = True
-                    result = StreamResult(
-                        content=state["content"],
-                        thinking=state["thinking"],
-                        prompt_tokens=estimate_tokens("\n".join(m.get("content", "") for m in api_messages)),
-                        completion_tokens=state["completion_tokens"],
-                        reasoning_tokens=0,
-                        elapsed=time.monotonic() - start_ts,
-                        interrupted=True,
-                    )
-
-                # Финальный рендер
-                live.update(self._render_final(result, model_info, model_label))
-
-        finally:
-            self.console.print(Rule(style="dim"))
-
-        if interrupted:
-            self.show_info("Генерация прервана.")
-
-        return result  # type: ignore
-
-    def _render_final(
-        self,
-        result: StreamResult,
-        model_info: Optional[ModelInfo],
-        model_label: str,
-    ) -> Group:
-        """Финальный рендер ответа (без ~ и ...)."""
-        blocks = []
-
-        if result.thinking:
-            blocks.append(Text("💭 Размышления", style="bold dim"))
-            blocks.append(Text(result.thinking, style="dim italic"))
-            blocks.append(Text(""))
-
-        blocks.append(Text(f"🤖 {model_label}", style="bold green"))
-        blocks.append(Text(""))
-        if result.content:
-            blocks.append(Markdown(result.content))
-        else:
-            blocks.append(Text("(пустой ответ)", style="dim"))
-
-        cost = calculate_cost(result.prompt_tokens, result.completion_tokens, model_info)
-        if cost is not None:
-            cost_str = f"{cost:.4f}₽"
-        else:
-            cost_str = "—"
-
-        reasoning_part = f" (💭{result.reasoning_tokens})" if result.reasoning_tokens else ""
-        interrupted_part = " [прервано]" if result.interrupted else ""
-
-        stats = Text(
-            f"\n ⏱ Токены: ↑{result.prompt_tokens} ↓{result.completion_tokens}{reasoning_part}"
-            f"  │  💰 {cost_str}  │  ⏳ {result.elapsed:.1f}с{interrupted_part}",
-            style="dim cyan"
+    def _handle_context_overflow(self, model_info: Optional[ModelInfo]) -> bool:
+        """
+        Обрабатывает превышение контекста: предлагает обрезать старые сообщения.
+        Возвращает True, если контекст обрезан и нужно повторить запрос.
+        """
+        window = model_info.context_window if model_info else 0
+        self.show_error(
+            f"Превышен контекст модели ({window} токенов). "
+            f"Используйте /new для нового разговора."
         )
-        blocks.append(stats)
-        return Group(*blocks)
+        answer = self.console.input(
+            "[bold]Удалить старые сообщения и повторить? (y/n): [/bold]"
+        ).strip().lower()
+        if answer == "y":
+            # Удаляем самые старые сообщения (кроме system)
+            system_msgs = [m for m in self.session.messages if m.role == "system"]
+            other_msgs = [m for m in self.session.messages if m.role != "system"]
+            # Удаляем половину старых
+            keep = other_msgs[len(other_msgs) // 2 :]
+            self.session.messages = system_msgs + keep
+            return True
+        return False
 
-    # ── Проверка контекста ────────────────────────────────────────────────
-    def _check_context_size(self) -> None:
-        """Предупреждает если контекст близок к лимиту."""
+    # ------------------------------------------------------------------ #
+    #  Управление контекстом
+    # ------------------------------------------------------------------ #
+    def _check_context(self) -> None:
+        """Проверяет приблизительный размер контекста и предупреждает."""
         model_info = self._current_model_info()
         if model_info is None:
             return
-        total_text = "\n".join(m.content for m in self.session.messages)
-        tokens = estimate_tokens(total_text)
+        total = sum(
+            self.client.estimate_tokens(m.content) for m in self.session.messages
+        )
         window = model_info.context_window
-        ratio = tokens / window if window > 0 else 0
+        if window <= 0:
+            return
+        ratio = total / window
+        if ratio > CONTEXT_WARN_THRESHOLD:
+            pct = int(ratio * 100)
+            self.console.print(
+                f"Внимание: использовано ~{pct}% контекста ({total}/{window})",
+                style="yellow",
+            )
 
-        if ratio > 0.8:
-            self.console.print(Text(
-                f"Внимание: использовано ~{int(ratio * 100)}% контекста ({tokens}/{window})",
-                style="bold yellow"
-            ))
+    # ------------------------------------------------------------------ #
+    #  Обработка команд
+    # ------------------------------------------------------------------ #
+    def handle_command(self, text: str) -> None:
+        """Разбирает и выполняет команду, начинающуюся с '/'."""
+        parts = text.strip().split()
+        cmd = parts[0].lower()
+        args = parts[1:]
 
-    # ── Выход ─────────────────────────────────────────────────────────────
-    def _exit_gracefully(self) -> None:
-        """Сохранение сессии и выход."""
-        self.save_session()
-        self.console.print(Text("До свидания!", style="bold cyan"))
+        if cmd == "/new":
+            self._cmd_new(clear="--clear" in args)
+        elif cmd == "/history":
+            self._cmd_history(args)
+        elif cmd == "/model":
+            self._cmd_model(args)
+        elif cmd in ("/markdown", "/md"):
+            self._cmd_markdown(cmd, args)
+        elif cmd == "/file":
+            self._cmd_file(args)
+        elif cmd == "/clear":
+            self._cmd_clear()
+        elif cmd == "/usage":
+            self._cmd_usage()
+        elif cmd == "/help":
+            self._cmd_help()
+        elif cmd == "/exit":
+            self._cmd_exit()
+        else:
+            self.show_info(
+                f"Неизвестная команда: {cmd}. Введите /help для справки."
+            )
 
+    def _cmd_new(self, clear: bool = False) -> None:
+        """Команда /new — новый разговор."""
+        self.history_mgr.save(self.session)
+        self.session = self._new_session()
+        # Сбрасываем статистику сессии
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_cost = 0.0
+        self.session_requests = 0
+        if clear:
+            self.console.clear()
+            self.show_banner()
+        self.show_info("Сессия сохранена. Новый разговор начат.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Точка входа
-# ──────────────────────────────────────────────────────────────────────────────
+    def _cmd_history(self, args: list[str]) -> None:
+        """Команда /history — список/загрузка сессий."""
+        # /history <session_id>
+        if args and args[0] != "all":
+            session_id = args[0]
+            loaded = self.history_mgr.load(session_id)
+            if loaded is None:
+                self.show_info(f"Сессия {session_id} не найдена")
+                return
+            self._load_session(loaded)
+            return
 
-def main() -> None:
-    """Точка входа в приложение."""
-    debug = "--debug" in sys.argv
+        # /history all — все сессии, иначе последние 20
+        limit = None if (args and args[0] == "all") else 20
+        sessions = self.history_mgr.list_sessions(limit=limit)
+        if not sessions:
+            self.show_info("История пуста.")
+            return
 
-    console = Console()
+        # Таблица
+        table = Table(title="История чатов")
+        table.add_column("№", justify="right", style="cyan")
+        table.add_column("Дата", style="green")
+        table.add_column("Модель")
+        table.add_column("Первое сообщение")
+        table.add_column("Токены", justify="right", style="dim cyan")
 
-    # Создание конфига при первом запуске
-    if Config.ensure_exists(CONFIG_PATH):
-        console.print(Panel(
-            Text(
-                f"Конфиг создан: {CONFIG_PATH}\n"
-                "Укажите api_key и запустите снова.",
-                style="bold yellow"
-            ),
-            title="Первый запуск",
-            border_style="yellow"
-        ))
+        for i, sess in enumerate(sessions, 1):
+            first = sess.first_user_message().replace("\n", " ")
+            if len(first) > 60:
+                first = first[:57] + "..."
+            date_str = sess.created_at.replace("T", " ")
+            table.add_row(
+                str(i),
+                date_str,
+                self._model_display_name(sess.default_model),
+                first,
+                str(sess.total_tokens),
+            )
+        self.console.print(table)
+
+        # Запрос номера для загрузки
+        choice = self.console.input(
+            "[dim]Введите номер для загрузки (Enter — отмена): [/dim]"
+        ).strip()
+        if not choice:
+            return
+        if not choice.isdigit():
+            self.show_info("Некорректный номер.")
+            return
+        idx = int(choice) - 1
+        if not (0 <= idx < len(sessions)):
+            self.show_info("Номер вне диапазона.")
+            return
+        # Перезагружаем полную сессию по id
+        full = self.history_mgr.load(sessions[idx].session_id)
+        if full:
+            self._load_session(full)
+
+    def _load_session(self, session: Session) -> None:
+        """Загружает сессию как текущий контекст."""
+        # Сохраняем текущую сессию перед заменой
+        self.history_mgr.save(self.session)
+        self.session = session
+        if session.default_model:
+            self.current_model_id = session.default_model
+        # Сбрасываем статистику сессии (она пересчитывается из загруженной)
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_cost = 0.0
+        self.session_requests = 0
+        for m in session.messages:
+            if m.role == "assistant" and m.usage:
+                self.session_prompt_tokens += m.usage.get("prompt_tokens", 0)
+                self.session_completion_tokens += m.usage.get("completion_tokens", 0)
+                self.session_requests += 1
+        self.console.clear()
+        self.show_banner()
+        self.show_info(f"Загружена сессия {session.session_id}")
+        # Кратко выводим историю
+        self._replay_session()
+
+    def _replay_session(self) -> None:
+        """Выводит сообщения загруженной сессии."""
+        for m in self.session.messages:
+            if m.role == "system":
+                continue
+            if m.role == "user":
+                self._rule()
+                self.console.print("Вы › ", style="bold", end="")
+                self.console.print(m.content, markup=False, highlight=False)
+            elif m.role == "assistant":
+                self._rule()
+                name = self._model_display_name(m.model)
+                self.console.print(f"🤖 {name}", style="bold green")
+                self.console.print()
+                if m.thinking:
+                    think = Text(style="dim italic")
+                    think.append("💭 Размышления:\n")
+                    for ln in m.thinking.splitlines():
+                        think.append(f"   {ln}\n")
+                    self.console.print(think)
+                self.console.print(self.render_response(m.content))
+        self._rule()
+
+    def _cmd_model(self, args: list[str]) -> None:
+        """Команда /model — выбор/переключение модели."""
+        if not self.config.models:
+            self.show_info("Список моделей пуст (config.models).")
+            return
+
+        # /model без аргументов — пронумерованный список
+        if not args:
+            self._show_model_list()
+            choice = self.console.input(
+                "[dim]Введите номер модели (Enter — отмена): [/dim]"
+            ).strip()
+            if not choice:
+                return
+            matches = self.config.search_models(choice)
+            if len(matches) == 1:
+                self._switch_model(matches[0])
+            else:
+                self.show_info("Модель не найдена")
+            return
+
+        # Парсим флаги
+        provider: Optional[str] = None
+        make_default = False
+        positional: list[str] = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--provider":
+                if i + 1 < len(args):
+                    provider = args[i + 1]
+                    i += 2
+                    continue
+            elif a == "--default":
+                make_default = True
+            else:
+                positional.append(a)
+            i += 1
+
+        query = " ".join(positional)
+        matches = self.config.search_models(query)
+
+        if len(matches) == 0:
+            self.show_info("Модель не найдена")
+            return
+        if len(matches) > 1:
+            self.show_info("Найдено несколько моделей:")
+            for m in matches:
+                self.console.print(f"  • {m.name} ({m.id})", style="dim")
+            return
+
+        model = matches[0]
+        self._switch_model(model, announce=False)
+
+        # Обработка --provider
+        if provider:
+            # Пытаемся найти провайдера в конфиге (если поддерживается),
+            # иначе просто обновляем api_base нельзя без данных — сообщаем.
+            self.show_info(
+                f"Модель переключена на {model.name}, провайдер: {provider}"
+            )
+        # Обработка --default
+        elif make_default:
+            self.config.set_default_model(model.id)
+            self.show_info(f"Модель {model.name} установлена по умолчанию.")
+        else:
+            self.show_info(f"Модель переключена на {model.name}")
+
+    def _show_model_list(self) -> None:
+        """Выводит пронумерованный список моделей."""
+        table = Table(title="Доступные модели")
+        table.add_column("№", justify="right", style="cyan")
+        table.add_column("Название")
+        table.add_column("ID", style="dim")
+        table.add_column("Контекст", justify="right")
+        table.add_column("💭", justify="center")
+        for i, m in enumerate(self.config.models, 1):
+            marker = "✓" if m.id == self.current_model_id else ""
+            thinking = "💭" if m.supports_thinking else ""
+            table.add_row(
+                str(i) + (" " + marker if marker else ""),
+                m.name,
+                m.id,
+                str(m.context_window),
+                thinking,
+            )
+        self.console.print(table)
+
+    def _switch_model(self, model: ModelInfo, announce: bool = True) -> None:
+        """Переключает текущую модель."""
+        self.current_model_id = model.id
+        self.session.default_model = model.id
+        if announce:
+            self.show_info(f"Модель переключена на {model.name}")
+
+    def _cmd_markdown(self, cmd: str, args: list[str]) -> None:
+        """Команда /markdown и /md — управление режимом рендеринга."""
+        arg = args[0].lower() if args else ""
+
+        if not arg:
+            # /md без аргумента — переключить; /markdown — показать состояние
+            if cmd == "/md":
+                self.markdown_enabled = not self.markdown_enabled
+                state = "ВКЛ" if self.markdown_enabled else "ВЫКЛ"
+                self.show_info(f"Markdown-рендеринг: {state}")
+            else:
+                state = "ВКЛ" if self.markdown_enabled else "ВЫКЛ"
+                self.show_info(f"Markdown-рендеринг: {state}")
+            return
+
+        if arg == "on":
+            self.markdown_enabled = True
+            self.show_info("Markdown-рендеринг включён.")
+        elif arg == "off":
+            self.markdown_enabled = False
+            self.show_info("Markdown-рендеринг выключен.")
+        elif arg == "toggle":
+            self.markdown_enabled = not self.markdown_enabled
+            state = "ВКЛ" if self.markdown_enabled else "ВЫКЛ"
+            self.show_info(f"Markdown-рендеринг: {state}")
+        else:
+            self.show_info(f"Неизвестный аргумент: {arg}")
+
+    def _cmd_file(self, args: list[str]) -> None:
+        """Команда /file — отправить содержимое текстового файла."""
+        if not args:
+            self.show_info("Укажите путь: /file <путь>")
+            return
+        path = Path(" ".join(args)).expanduser()
+        if not path.exists():
+            self.show_error(f"Файл не найден: {path}")
+            return
+        # Проверка размера
+        size = path.stat().st_size
+        if size > MAX_FILE_SIZE:
+            self.show_error(
+                f"Файл слишком большой ({size} байт, максимум {MAX_FILE_SIZE})."
+            )
+            return
+        # Чтение
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            self.show_error(
+                f"Не удалось прочитать файл: {e}. "
+                f"Убедитесь что файл в кодировке UTF-8."
+            )
+            return
+
+        # Превью (первые 3 строки + размер)
+        lines = content.splitlines()
+        preview = "\n".join(lines[:3])
+        self.console.print(
+            Panel(
+                Text(preview, no_wrap=False),
+                title=f"Превью: {path.name} ({size} байт)",
+                border_style="cyan",
+            )
+        )
+        answer = self.console.input(
+            "[bold]Отправить содержимое файла? (y/n): [/bold]"
+        ).strip().lower()
+        if answer == "y":
+            self.send_message(content)
+
+    def _cmd_clear(self) -> None:
+        """Команда /clear — очистить экран (контекст сохраняется)."""
+        self.console.clear()
+        self.show_banner()
+
+    def _cmd_usage(self) -> None:
+        """Команда /usage — статистика сессии и за всё время."""
+        # Текущая сессия
+        avg = (
+            self.session_cost / self.session_requests
+            if self.session_requests
+            else 0.0
+        )
+        sess_table = Table(title="Текущая сессия")
+        sess_table.add_column("Метрика")
+        sess_table.add_column("Значение", justify="right")
+        sess_table.add_row("Prompt токены", str(self.session_prompt_tokens))
+        sess_table.add_row("Completion токены", str(self.session_completion_tokens))
+        sess_table.add_row("Стоимость", f"{self.session_cost:.4f}₽")
+        sess_table.add_row("Запросов", str(self.session_requests))
+        sess_table.add_row("Средняя стоимость запроса", f"{avg:.4f}₽")
+        self.console.print(sess_table)
+
+        # За всё время
+        d = self.usage_tracker.data
+        all_table = Table(title="За всё время")
+        all_table.add_column("Метрика")
+        all_table.add_column("Значение", justify="right")
+        all_table.add_row("Prompt токены", str(d.get("total_prompt_tokens", 0)))
+        all_table.add_row(
+            "Completion токены", str(d.get("total_completion_tokens", 0))
+        )
+        all_table.add_row(
+            "Суммарная стоимость", f"{d.get('total_cost_rub', 0.0):.4f}₽"
+        )
+        all_table.add_row("Всего запросов", str(d.get("total_requests", 0)))
+        self.console.print(all_table)
+
+    def _cmd_help(self) -> None:
+        """Команда /help — таблица команд."""
+        table = Table(title="Команды")
+        table.add_column("Команда", style="bold yellow")
+        table.add_column("Описание")
+        rows = [
+            ("/new [--clear]", "Новый разговор (--clear — очистить экран)"),
+            ("/history [all|<id>]", "Список/загрузка сессий"),
+            ("/model [имя|№] [--default] [--provider <p>]", "Выбор модели"),
+            ("/markdown [on|off|toggle]", "Управление markdown-рендерингом"),
+            ("/md [on|off|toggle]", "То же; без аргумента — переключить"),
+            ("/file <путь>", "Отправить содержимое текстового файла"),
+            ("/clear", "Очистить экран (контекст сохраняется)"),
+            ("/usage", "Статистика токенов и стоимости"),
+            ("/help", "Эта справка"),
+            ("/exit", "Выход"),
+        ]
+        for cmd, desc in rows:
+            table.add_row(cmd, desc)
+        self.console.print(table)
+        self.console.print(
+            "\n[dim]Многострочный ввод: Enter — новая строка, "
+            "Ctrl+Enter — отправить.[/dim]"
+        )
+        state = "ВКЛ" if self.markdown_enabled else "ВЫКЛ"
+        self.console.print(
+            f"[dim]Markdown-рендеринг сейчас: {state} "
+            f"(переключить: /md).[/dim]"
+        )
+
+    def _cmd_exit(self) -> None:
+        """Команда /exit — сохранить и выйти."""
+        self.history_mgr.save(self.session)
+        self.console.print("До свидания!", style="dim")
         sys.exit(0)
 
-    # Загрузка и валидация конфига
+    # ------------------------------------------------------------------ #
+    #  Главный цикл
+    # ------------------------------------------------------------------ #
+    def run(self) -> None:
+        """Запускает интерактивный цикл ввода/вывода."""
+        self.console.clear()
+        self.show_banner()
+
+        # Предупреждение, если default_model не найдена в списке
+        if self.config.models and self._current_model_info() is None:
+            self.show_info(
+                f"Модель {self.current_model_id} не найдена в списке models. "
+                f"Стоимость не будет рассчитываться."
+            )
+
+        while True:
+            try:
+                # Подсказка при первом запуске
+                if not self._hint_shown:
+                    self.console.print(
+                        "[dim](Ctrl+Enter — отправить, /help — справка, "
+                        "/md — markdown ВКЛ/ВЫКЛ)[/dim]"
+                    )
+
+                user_input = self.prompt_session.prompt("Вы › ")
+
+                # Скрываем подсказку после первого ввода
+                self._hint_shown = True
+
+                # Пустой ввод — игнорируем
+                if not user_input or not user_input.strip():
+                    continue
+
+                stripped = user_input.strip()
+
+                # Команда?
+                if stripped.startswith("/"):
+                    self.handle_command(stripped)
+                    continue
+
+                # Обычное сообщение
+                self.send_message(stripped)
+
+            except KeyboardInterrupt:
+                # Ctrl+C в режиме ожидания ввода — выход
+                self.history_mgr.save(self.session)
+                self.console.print("\nДо свидания!", style="dim")
+                sys.exit(0)
+            except EOFError:
+                # Ctrl+D — аналог /exit
+                self.history_mgr.save(self.session)
+                self.console.print("\nДо свидания!", style="dim")
+                sys.exit(0)
+
+    # ------------------------------------------------------------------ #
+    #  Неинтерактивный режим / одиночный запрос
+    # ------------------------------------------------------------------ #
+    def run_single_output(self, user_text: str) -> None:
+        """
+        Неинтерактивный режим (--output): отправить запрос, вывести только
+        ответ в stdout и завершить работу.
+        """
+        self.session.messages.append(Message(role="user", content=user_text))
+        api_messages = [m.to_api_dict() for m in self.session.messages]
+        model_info = self._current_model_info()
+
+        try:
+            result = self.client.stream(
+                self.current_model_id, api_messages, on_chunk=None
+            )
+        except Exception as e:
+            print(f"Ошибка: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Выводим только текст ответа
+        print(result.content)
+
+        # Сохраняем сессию и статистику
+        cost = self.client.calc_cost(
+            model_info, result.prompt_tokens, result.completion_tokens
+        )
+        assistant_msg = Message(
+            role="assistant",
+            content=result.content,
+            model=self.current_model_id,
+            thinking=result.thinking if result.thinking else None,
+            usage={
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+            },
+        )
+        self.session.messages.append(assistant_msg)
+        self.usage_tracker.add(
+            result.prompt_tokens,
+            result.completion_tokens,
+            cost if cost is not None else 0.0,
+        )
+        self.history_mgr.save(self.session)
+
+    def load_session_by_id(self, session_id: str) -> bool:
+        """Загружает сессию по id как контекст (для --history). True — успех."""
+        loaded = self.history_mgr.load(session_id)
+        if loaded is None:
+            self.show_error(f"Сессия {session_id} не найдена")
+            return False
+        self.session = loaded
+        if loaded.default_model:
+            self.current_model_id = loaded.default_model
+        for m in loaded.messages:
+            if m.role == "assistant" and m.usage:
+                self.session_prompt_tokens += m.usage.get("prompt_tokens", 0)
+                self.session_completion_tokens += m.usage.get("completion_tokens", 0)
+                self.session_requests += 1
+        return True
+
+
+# ============================================================================
+# 9. ТОЧКА ВХОДА
+# ============================================================================
+def read_text_file(path_str: str) -> Optional[str]:
+    """
+    Читает текстовый файл UTF-8 с проверкой существования и размера.
+    Возвращает содержимое или None (с выводом ошибки в stderr).
+    """
+    path = Path(path_str).expanduser()
+    if not path.exists():
+        print(f"Файл не найден: {path}", file=sys.stderr)
+        return None
+    if path.stat().st_size > MAX_FILE_SIZE:
+        print(f"Файл слишком большой (максимум {MAX_FILE_SIZE} байт).", file=sys.stderr)
+        return None
     try:
-        config = Config.load(CONFIG_PATH)
+        return path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        print(
+            f"Не удалось прочитать файл: {e}. "
+            f"Убедитесь что файл в кодировке UTF-8.",
+            file=sys.stderr,
+        )
+        return None
+
+
+def main() -> None:
+    """Точка входа: парсинг аргументов и запуск нужного режима."""
+    parser = argparse.ArgumentParser(
+        description="🤖 AI Chat — терминальный чат-клиент для LLM"
+    )
+    parser.add_argument(
+        "--markdown", "-m", action="store_true",
+        help="Принудительно включить markdown-режим",
+    )
+    parser.add_argument(
+        "--no-markdown", action="store_true",
+        help="Принудительно выключить markdown-режим",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Полный traceback ошибок в stderr",
+    )
+    parser.add_argument(
+        "--history", metavar="SESSION_ID",
+        help="Открыть сохранённую сессию при запуске",
+    )
+    parser.add_argument(
+        "--input", metavar="FILE",
+        help="Считать текстовый файл как запрос пользователя",
+    )
+    parser.add_argument(
+        "--output", metavar="TEXT",
+        help="Неинтерактивный режим: отправить текст, вывести ответ и выйти",
+    )
+    args = parser.parse_args()
+
+    # Загрузка конфига
+    try:
+        config = Config.load()
     except ConfigError as e:
-        console.print(Panel(
-            Text(f"Ошибка конфига: {e}", style="bold red"),
-            title="Ошибка",
-            border_style="red"
-        ))
+        # Выводим ошибку конфига без traceback
+        Console().print(Panel(Text(str(e), style="bold red"),
+                              title="Ошибка", border_style="red"))
         sys.exit(1)
 
-    # Запуск UI
-    try:
-        ui = ChatUI(config, debug=debug)
+    # Определяем режим markdown с учётом флагов
+    markdown_enabled = config.render_markdown
+    if args.markdown:
+        markdown_enabled = True
+    if args.no_markdown:
+        markdown_enabled = False
+
+    # Инициализация компонентов
+    client = ChatClient(config)
+    history_mgr = HistoryManager()
+    usage_tracker = UsageTracker()
+
+    ui = ChatUI(
+        config=config,
+        client=client,
+        history_mgr=history_mgr,
+        usage_tracker=usage_tracker,
+        markdown_enabled=markdown_enabled,
+        debug=args.debug,
+    )
+
+    # Загрузка сессии из --history (как контекст)
+    if args.history:
+        if not ui.load_session_by_id(args.history):
+            sys.exit(1)
+
+    # Определяем текст запроса из --input / --output
+    request_text: Optional[str] = None
+    if args.input:
+        request_text = read_text_file(args.input)
+        if request_text is None:
+            sys.exit(1)
+    if args.output:
+        request_text = args.output
+
+    # Неинтерактивный режим (--output): вывести ответ и выйти
+    if args.output is not None:
+        ui.run_single_output(request_text or "")
+        sys.exit(0)
+
+    # Режим --input: отправить файл как запрос, затем продолжить интерактивно
+    if args.input:
+        ui.console.clear()
+        ui.show_banner()
+        ui.send_message(request_text or "")
+        ui._hint_shown = True
         ui.run()
-    except Exception as e:
-        if debug:
-            traceback.print_exc(file=sys.stderr)
-        console.print(Panel(
-            Text(f"Фатальная ошибка: {e}", style="bold red"),
-            title="Ошибка",
-            border_style="red"
-        ))
-        sys.exit(1)
+        return
+
+    # Обычный интерактивный режим
+    ui.run()
 
 
 if __name__ == "__main__":
